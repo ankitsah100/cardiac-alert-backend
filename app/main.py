@@ -67,6 +67,52 @@ def register_patient(data: RegisterPatient):
 async def post_reading(reading: WatchReading):
     return await process_reading(reading)
 
+
+@app.post("/healthconnect")
+async def health_connect_webhook(payload: dict):
+    """
+    Accepts data from Life Dashboard Companion app.
+    Extracts heart rate, SpO2, HRV and processes them.
+    """
+    try:
+        # Extract heart rate — take latest reading
+        hr = None
+        hr_list = payload.get("heart_rate", [])
+        if hr_list:
+            hr = hr_list[-1].get("bpm") or hr_list[-1].get("beatsPerMinute")
+
+        # Extract SpO2
+        spo2 = None
+        spo2_list = payload.get("oxygen_saturation", [])
+        if spo2_list:
+            spo2 = spo2_list[-1].get("percentage") or spo2_list[-1].get("value")
+            if spo2 and spo2 < 2:  # stored as 0.98 not 98
+                spo2 = spo2 * 100
+
+        # Extract HRV
+        hrv = None
+        hrv_list = payload.get("heart_rate_variability", [])
+        if hrv_list:
+            hrv = hrv_list[-1].get("heartRateVariabilityMillis") or hrv_list[-1].get("value")
+
+        # Fallback if no HR found
+        if not hr:
+            return {"message": "No heart rate data found in payload", "received_keys": list(payload.keys())}
+
+        # Build a WatchReading and process it
+        reading = WatchReading(
+            patient_id="ankit_001",
+            timestamp=time.time(),
+            heart_rate=float(hr),
+            spo2=float(spo2) if spo2 else None,
+            hrv_rmssd=float(hrv) if hrv else None,
+        )
+        result = await process_reading(reading)
+        return result
+
+    except Exception as e:
+        return {"error": str(e), "received_keys": list(payload.keys())}
+
 @app.get("/patient/{patient_id}/status")
 def get_status(patient_id: str):
     latest = store.get_latest(patient_id)
