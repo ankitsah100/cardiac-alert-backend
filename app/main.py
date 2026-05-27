@@ -178,3 +178,31 @@ async def process_reading(reading: WatchReading) -> dict:
             try: await ws.send_text(json.dumps({"type": "alert", "data": result}))
             except: dashboard_clients.remove(ws)
     return result
+
+@app.get("/patient/{patient_id}/summary")
+def get_summary(patient_id: str):
+    latest = store.get_latest(patient_id)
+    if not latest:
+        return "No data yet. Sync your watch first."
+    hr = latest.get("heart_rate", "?")
+    spo2 = latest.get("spo2")
+    hrv = latest.get("hrv_rmssd")
+    risk = latest.get("risk_level", "unknown").upper()
+    score = latest.get("risk_score", 0)
+    flags = latest.get("flags", [])
+    if risk == "CRITICAL":
+        emoji = "🚨"
+    elif risk == "WARNING":
+        emoji = "⚠️"
+    else:
+        emoji = "✅"
+    msg = f"{emoji} HR: {hr} bpm | Risk: {risk}"
+    if spo2:
+        msg += f" | SpO2: {spo2}%"
+    if hrv:
+        msg += f" | HRV: {hrv}ms"
+    if flags:
+        flag_text = ", ".join(flags).replace("_", " ")
+        msg += f"\nFlags: {flag_text}"
+    msg += f"\nScore: {score}"
+    return msg
