@@ -23,6 +23,9 @@ alert_mgr = AlertManager()
 store = DataStore()
 dashboard_clients: list[WebSocket] = []
 
+# Auto-register default patient on startup
+store.register_patient({"patient_id": "ankit_001", "name": "Ankit", "age": 26, "emergency_contact": "+9779800000000", "baseline_hr": 72.0, "baseline_hrv": 45.0})
+
 class WatchReading(BaseModel):
     patient_id: str
     timestamp: float
