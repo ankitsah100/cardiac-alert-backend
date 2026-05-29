@@ -78,31 +78,33 @@ async def health_connect_webhook(payload: dict):
     Extracts heart rate, SpO2, HRV and processes them.
     """
     try:
-        # Extract heart rate — take latest reading
-        hr = None
-        hr_list = payload.get("heart_rate", [])
-        if hr_list:
-            hr = hr_list[-1].get("bpm") or hr_list[-1].get("beatsPerMinute")
+        from datetime import datetime, timezone
 
-        # Extract SpO2
-        spo2 = None
-        spo2_list = payload.get("oxygen_saturation", [])
-        if spo2_list:
-            spo2 = spo2_list[-1].get("percentage") or spo2_list[-1].get("value")
-            if spo2 and spo2 < 2:  # stored as 0.98 not 98
-                spo2 = spo2 * 100
+        def latest_by_time(records, value_keys):
+            if not records:
+                return None
+            def parse_time(r):
+                t = r.get("end_time") or r.get("start_time") or ""
+                try:
+                    return datetime.fromisoformat(t.replace("Z", "+00:00"))
+                except:
+                    return datetime.min.replace(tzinfo=timezone.utc)
+            records_sorted = sorted(records, key=parse_time, reverse=True)
+            for r in records_sorted:
+                for k in value_keys:
+                    if r.get(k) is not None:
+                        return r[k]
+            return None
 
-        # Extract HRV
-        hrv = None
-        hrv_list = payload.get("heart_rate_variability", [])
-        if hrv_list:
-            hrv = hrv_list[-1].get("heartRateVariabilityMillis") or hrv_list[-1].get("value")
+        hr = latest_by_time(payload.get("heart_rate", []), ["bpm", "beatsPerMinute", "value"])
+        spo2 = latest_by_time(payload.get("oxygen_saturation", []), ["percentage", "value"])
+        if spo2 and spo2 < 2:
+            spo2 = spo2 * 100
+        hrv = latest_by_time(payload.get("heart_rate_variability", []), ["heartRateVariabilityMillis", "value"])
 
-        # Fallback if no HR found
         if not hr:
             return {"message": "No heart rate data found in payload", "received_keys": list(payload.keys())}
 
-        # Build a WatchReading and process it
         reading = WatchReading(
             patient_id="ankit_001",
             timestamp=time.time(),
@@ -184,28 +186,30 @@ async def process_reading(reading: WatchReading) -> dict:
 
 @app.get("/patient/{patient_id}/summary")
 def get_summary(patient_id: str):
+    import time as t
     latest = store.get_latest(patient_id)
     if not latest:
-        return "No data yet. Sync your watch first."
+        return "No data yet. Sync Life Dashboard first."
+    processed_at = latest.get("processed_at", 0)
+    age_minutes = (t.time() - processed_at) / 60
+    if age_minutes > 120:
+        h = int(age_minutes // 60)
+        m = int(age_minutes % 60)
+        return f"Last reading: {h}h {m}m ago. Open Life Dashboard and tap Sync Now."
     hr = latest.get("heart_rate", "?")
     spo2 = latest.get("spo2")
-    hrv = latest.get("hrv_rmssd")
     risk = latest.get("risk_level", "unknown").upper()
-    score = latest.get("risk_score", 0)
     flags = latest.get("flags", [])
+    age_str = f"{int(age_minutes)}min ago"
     if risk == "CRITICAL":
-        emoji = "🚨"
+        emoji = "CRITICAL ALERT"
     elif risk == "WARNING":
-        emoji = "⚠️"
+        emoji = "WARNING"
     else:
-        emoji = "✅"
-    msg = f"{emoji} HR: {hr} bpm | Risk: {risk}"
+        emoji = "NORMAL"
+    msg = f"HR: {hr} bpm | {emoji} | {age_str}"
     if spo2:
         msg += f" | SpO2: {spo2}%"
-    if hrv:
-        msg += f" | HRV: {hrv}ms"
     if flags:
-        flag_text = ", ".join(flags).replace("_", " ")
-        msg += f"\nFlags: {flag_text}"
-    msg += f"\nScore: {score}"
+        msg += " | " + ", ".join(flags).replace("_", " ")
     return msg
