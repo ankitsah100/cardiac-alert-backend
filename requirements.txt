@@ -1,4 +1,6 @@
 fastapi
 uvicorn[standard]
 numpy
+scikit-learn
+joblib
 twilio
