@@ -47,7 +47,7 @@ class CardiacAnalyzer:
         otherwise use rule-based thresholds for watch HR/SpO2 data.
         """
         # Use ML model if raw ECG signal provided
-        if reading.ppg_signal and len(reading.ppg_signal) == 180 and self._ml_model:
+        if reading.ppg_signal and len(reading.ppg_signal) >= 100 and self._ml_model:
             return self._ml_score(reading)
 
         # Otherwise use rule-based scoring
@@ -55,7 +55,7 @@ class CardiacAnalyzer:
 
     def _ml_score(self, reading) -> dict:
         """ML-based scoring using trained ECG model."""
-        features = np.array(reading.ppg_signal).reshape(1, -1)
+        features = np.array(reading.ppg_signal[:180]).reshape(1, -1)
         prediction = self._ml_model.predict(features)[0]
         probabilities = self._ml_model.predict_proba(features)[0]
         classes = self._ml_model.classes_
