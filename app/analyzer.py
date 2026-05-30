@@ -30,7 +30,7 @@ class CardiacAnalyzer:
 
     def _load_model(self):
         """Try to load trained ML model if available."""
-        model_path = os.path.join(os.path.dirname(__file__), '..', 'cardiac_model_v2.pkl')
+        model_path = os.path.join(os.path.dirname(__file__), '..', 'cardiac_model_v3.pkl')
         model_path = os.path.abspath(model_path)
         if os.path.exists(model_path):
             try:
