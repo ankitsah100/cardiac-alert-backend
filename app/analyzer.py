@@ -1,36 +1,96 @@
 """
-CardiacAnalyzer
-Scores incoming watch readings for cardiac risk.
-Uses rule-based thresholds + HRV analysis.
-Replace score() internals with your trained ML model later.
+CardiacAnalyzer — ML + Rule based hybrid
+Uses trained Random Forest model when ECG data available,
+falls back to rule-based scoring for simple HR/SpO2 readings
+from smartwatches like Glory Fit.
 """
 
 import numpy as np
+import os
+import joblib
 from typing import Optional
 
 
 class CardiacAnalyzer:
 
-    # ── Thresholds ──────────────────────────────────────────────
-    HR_TACHY       = 120    # bpm  - tachycardia
-    HR_BRADY       = 45     # bpm  - bradycardia
+    # ── Rule-based thresholds (fallback for watch data) ──────────
+    HR_TACHY       = 120
+    HR_BRADY       = 45
     HR_CRITICAL_HI = 150
     HR_CRITICAL_LO = 35
-    SPO2_WARNING   = 94     # %
+    SPO2_WARNING   = 94
     SPO2_CRITICAL  = 90
-    HRV_LOW        = 20     # ms RMSSD - low HRV = high risk
-    RR_IRREGULAR   = 0.20   # 20% coefficient of variation = irregular rhythm
-    # ────────────────────────────────────────────────────────────
+    HRV_LOW        = 20
+    RR_IRREGULAR   = 0.20
+    # ─────────────────────────────────────────────────────────────
+
+    def __init__(self):
+        self._ml_model = None
+        self._load_model()
+
+    def _load_model(self):
+        """Try to load trained ML model if available."""
+        model_path = os.path.join(os.path.dirname(__file__), '..', 'cardiac_model.pkl')
+        model_path = os.path.abspath(model_path)
+        if os.path.exists(model_path):
+            try:
+                self._ml_model = joblib.load(model_path)
+                print(f"[Analyzer] ML model loaded from {model_path}")
+            except Exception as e:
+                print(f"[Analyzer] Could not load ML model: {e}")
+        else:
+            print(f"[Analyzer] No ML model found — using rule-based scoring")
 
     def score(self, reading, patient: Optional[dict]) -> dict:
         """
-        Returns:
-            {
-                "score": 0.0–1.0,
-                "level": "normal" | "warning" | "critical",
-                "flags": ["tachycardia", "low_hrv", ...]
-            }
+        Score a reading using ML model if ECG data available,
+        otherwise use rule-based thresholds for watch HR/SpO2 data.
         """
+        # Use ML model if raw ECG signal provided
+        if reading.ppg_signal and len(reading.ppg_signal) == 180 and self._ml_model:
+            return self._ml_score(reading)
+
+        # Otherwise use rule-based scoring
+        return self._rule_score(reading, patient)
+
+    def _ml_score(self, reading) -> dict:
+        """ML-based scoring using trained ECG model."""
+        features = np.array(reading.ppg_signal).reshape(1, -1)
+        prediction = self._ml_model.predict(features)[0]
+        probabilities = self._ml_model.predict_proba(features)[0]
+        classes = self._ml_model.classes_
+
+        prob_dict = dict(zip(classes, probabilities))
+        
+        # Map ECG labels to risk levels
+        label_map = {
+            'N': ('normal', 0.05),
+            'A': ('warning', 0.60),
+            'V': ('critical', 0.90),
+        }
+        level, base_score = label_map.get(prediction, ('warning', 0.50))
+        
+        # Confidence-weighted score
+        confidence = prob_dict.get(prediction, 0.5)
+        score = base_score * confidence
+
+        flags = []
+        if prediction == 'A':
+            flags.append('atrial_premature_beat')
+        elif prediction == 'V':
+            flags.append('ventricular_premature_beat')
+
+        return {
+            "score": round(score, 3),
+            "level": level,
+            "flags": flags,
+            "method": "ml_model",
+            "ml_prediction": prediction,
+            "ml_confidence": round(confidence * 100, 1)
+        }
+
+    def _rule_score(self, reading, patient: Optional[dict]) -> dict:
+        """Rule-based scoring for smartwatch HR/SpO2 data."""
         flags = []
         scores = []
 
@@ -39,7 +99,7 @@ class CardiacAnalyzer:
 
         hr = reading.heart_rate
 
-        # ── Heart rate ──────────────────────────────────────────
+        # Heart rate
         if hr >= self.HR_CRITICAL_HI:
             flags.append("critical_tachycardia")
             scores.append(0.95)
@@ -53,13 +113,12 @@ class CardiacAnalyzer:
             flags.append("bradycardia")
             scores.append(0.65)
 
-        # Deviation from personal baseline
         hr_dev = abs(hr - baseline_hr) / baseline_hr
         if hr_dev > 0.40:
             flags.append("large_hr_deviation")
             scores.append(0.55)
 
-        # ── SpO2 ────────────────────────────────────────────────
+        # SpO2
         if reading.spo2 is not None:
             if reading.spo2 <= self.SPO2_CRITICAL:
                 flags.append("critical_spo2")
@@ -68,46 +127,39 @@ class CardiacAnalyzer:
                 flags.append("low_spo2")
                 scores.append(0.55)
 
-        # ── HRV ─────────────────────────────────────────────────
+        # HRV
         if reading.hrv_rmssd is not None:
             hrv = reading.hrv_rmssd
             if hrv < self.HRV_LOW:
                 flags.append("low_hrv")
                 scores.append(0.65)
-            # Drop relative to personal baseline
             if baseline_hrv > 0:
                 hrv_drop = (baseline_hrv - hrv) / baseline_hrv
                 if hrv_drop > 0.50:
                     flags.append("hrv_collapse")
                     scores.append(0.80)
 
-        # ── RR interval irregularity ────────────────────────────
+        # RR intervals
         if reading.rr_intervals and len(reading.rr_intervals) >= 5:
             rr = np.array(reading.rr_intervals)
-            cv = rr.std() / rr.mean()   # coefficient of variation
+            cv = rr.std() / rr.mean()
             if cv > self.RR_IRREGULAR:
                 flags.append("irregular_rhythm")
-                scores.append(0.70 + min(cv * 0.5, 0.25))  # scale with severity
+                scores.append(0.70 + min(cv * 0.5, 0.25))
 
-        # ── PPG signal quality check ────────────────────────────
-        if reading.ppg_signal and len(reading.ppg_signal) >= 10:
-            ppg = np.array(reading.ppg_signal)
-            noise_ratio = self._noise_ratio(ppg)
-            if noise_ratio > 0.60:
-                flags.append("poor_signal_quality")
-                # Don't add to risk — just a data quality warning
-
-        # ── Final score ─────────────────────────────────────────
         if not scores:
-            final_score = 0.05    # baseline resting risk
+            final_score = 0.05
         else:
-            # Max risk drives the score, blended with average
             final_score = 0.6 * max(scores) + 0.4 * np.mean(scores)
             final_score = min(final_score, 1.0)
 
         level = self._level(final_score, flags)
-
-        return {"score": final_score, "level": level, "flags": flags}
+        return {
+            "score": round(final_score, 3),
+            "level": level,
+            "flags": flags,
+            "method": "rules"
+        }
 
     def _level(self, score: float, flags: list) -> str:
         critical_flags = {"critical_tachycardia", "critical_bradycardia",
@@ -117,13 +169,3 @@ class CardiacAnalyzer:
         if score >= 0.40 or flags:
             return "warning"
         return "normal"
-
-    def _noise_ratio(self, ppg: np.ndarray) -> float:
-        """Simple SNR proxy: ratio of high-freq energy to total."""
-        if len(ppg) < 4:
-            return 0.0
-        diff2 = np.diff(np.diff(ppg))  # second derivative ~ high freq
-        total_var = ppg.var()
-        if total_var == 0:
-            return 0.0
-        return float(diff2.var() / total_var)
