@@ -168,6 +168,9 @@ async def process_reading(reading: WatchReading) -> dict:
         "risk_score": round(risk["score"], 3),
         "risk_level": risk["level"],
         "flags": risk["flags"],
+        "method": risk.get("method", "rules"),
+        "ml_prediction": risk.get("ml_prediction"),
+        "ml_confidence": risk.get("ml_confidence"),
         "processed_at": time.time(),
     }
     store.save_reading(reading.patient_id, result)
