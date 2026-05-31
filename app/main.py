@@ -7,7 +7,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-from typing import Optional, Literal
+from typing import Optional
 from datetime import datetime
 import asyncio, json, time, math
 
@@ -23,12 +23,15 @@ alert_mgr = AlertManager()
 store = DataStore()
 dashboard_clients: list[WebSocket] = []
 
-# Auto-register default patient on startup
-store.register_patient({"patient_id": "ankit_001", "name": "Ankit", "age": 26, "emergency_contact": "+9779800000000", "baseline_hr": 72.0, "baseline_hrv": 45.0})
+store.register_patient({
+    "patient_id": "ankit_001", "name": "Ankit", "age": 26,
+    "emergency_contact": "+9779800000000",
+    "baseline_hr": 72.0, "baseline_hrv": 45.0
+})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EXISTING MODELS
+# MODELS
 # ─────────────────────────────────────────────────────────────────────────────
 
 class WatchReading(BaseModel):
@@ -47,11 +50,6 @@ class RegisterPatient(BaseModel):
     emergency_contact: str
     baseline_hr: Optional[float] = 72.0
     baseline_hrv: Optional[float] = 45.0
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# NEW MODELS — SYMPTOM ASSESSMENT
-# ─────────────────────────────────────────────────────────────────────────────
 
 class Symptoms(BaseModel):
     chest_pain: bool = False
@@ -95,7 +93,7 @@ class SymptomAssessmentRequest(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SCORING ENGINE
+# SYMPTOM SCORING ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _calc_bmi(w, h):
@@ -103,7 +101,7 @@ def _calc_bmi(w, h):
         return round(w / (h / 100) ** 2, 1)
     return None
 
-def _score(req: SymptomAssessmentRequest):
+def _symptom_score(req: SymptomAssessmentRequest):
     s = 0.0
     factors = []
 
@@ -112,21 +110,18 @@ def _score(req: SymptomAssessmentRequest):
         s += pts
         factors.append({"factor": label, "contribution": round(pts, 1), "severity": sev})
 
-    # Age (Framingham weights)
     age = req.age
     if age >= 75:        add("Age 75+", 18, "high")
     elif age >= 65:      add("Age 65-74", 13, "high")
     elif age >= 55:      add("Age 55-64", 8, "medium")
     elif age >= 45:      add("Age 45-54", 4, "medium")
 
-    # BMI
     bmi = _calc_bmi(req.weight_kg, req.height_cm)
     if bmi:
         if bmi >= 35:    add(f"Severe obesity (BMI {bmi})", 7, "high")
         elif bmi >= 30:  add(f"Obesity (BMI {bmi})", 4, "medium")
         elif bmi >= 25:  add(f"Overweight (BMI {bmi})", 2, "low")
 
-    # Symptoms
     sy = req.symptoms
     if sy.chest_pain:             add("Chest pain", 14, "high")
     if sy.shortness_of_breath:    add("Shortness of breath", 9, "high")
@@ -139,7 +134,6 @@ def _score(req: SymptomAssessmentRequest):
     if sy.chest_pain and sy.shortness_of_breath:
         add("ACS cluster (chest pain + dyspnea)", 8, "high")
 
-    # Medical history
     h = req.medical_history
     if h.previous_heart_attack:   add("Prior heart attack", 18, "high")
     if h.stroke:                  add("Prior stroke", 12, "high")
@@ -152,34 +146,110 @@ def _score(req: SymptomAssessmentRequest):
         if h.systolic_bp >= 180:    add(f"Hypertensive crisis (SBP {h.systolic_bp})", 10, "high")
         elif h.systolic_bp >= 160:  add(f"Stage 2 HTN (SBP {h.systolic_bp})", 6, "high")
         elif h.systolic_bp >= 140:  add(f"Stage 1 HTN (SBP {h.systolic_bp})", 3, "medium")
-
     if h.cholesterol_level:
-        if h.cholesterol_level >= 240:    add(f"High cholesterol ({h.cholesterol_level} mg/dL)", 5, "high")
-        elif h.cholesterol_level >= 200:  add(f"Borderline cholesterol ({h.cholesterol_level} mg/dL)", 2, "medium")
-
+        if h.cholesterol_level >= 240:    add(f"High cholesterol ({h.cholesterol_level})", 5, "high")
+        elif h.cholesterol_level >= 200:  add(f"Borderline cholesterol ({h.cholesterol_level})", 2, "medium")
     if h.fasting_blood_sugar:
-        if h.fasting_blood_sugar >= 126:  add(f"Diabetic glucose ({h.fasting_blood_sugar} mg/dL)", 6, "high")
-        elif h.fasting_blood_sugar >= 100: add(f"Pre-diabetic glucose ({h.fasting_blood_sugar} mg/dL)", 3, "medium")
+        if h.fasting_blood_sugar >= 126:  add(f"Diabetic glucose ({h.fasting_blood_sugar})", 6, "high")
+        elif h.fasting_blood_sugar >= 100: add(f"Pre-diabetic glucose ({h.fasting_blood_sugar})", 3, "medium")
 
-    # Lifestyle
     lf = req.lifestyle
-    if lf.smoking:                        add("Active smoking", 10, "high")
-    if lf.alcohol:                        add("Alcohol use", 4, "medium")
-    if lf.exercise_frequency == "none":   add("Sedentary lifestyle", 6, "medium")
+    if lf.smoking:                         add("Active smoking", 10, "high")
+    if lf.alcohol:                         add("Alcohol use", 4, "medium")
+    if lf.exercise_frequency == "none":    add("Sedentary lifestyle", 6, "medium")
     elif lf.exercise_frequency == "light": add("Low activity level", 3, "low")
-    if lf.stress_level == "high":         add("High chronic stress", 5, "medium")
-    elif lf.stress_level == "medium":     add("Moderate stress", 2, "low")
-    if lf.diet_quality == "poor":         add("Poor diet", 4, "medium")
+    if lf.stress_level == "high":          add("High chronic stress", 5, "medium")
+    elif lf.stress_level == "medium":      add("Moderate stress", 2, "low")
+    if lf.diet_quality == "poor":          add("Poor diet", 4, "medium")
 
     score = min(round(s, 1), 100.0)
-    level = (
-        "low"      if score < 20 else
-        "medium"   if score < 45 else
-        "high"     if score < 70 else
-        "critical"
-    )
     factors.sort(key=lambda x: x["contribution"], reverse=True)
-    return score, level, factors, bmi
+    return score, factors, bmi
+
+
+def _level(score: float) -> str:
+    if score < 20:  return "low"
+    if score < 45:  return "medium"
+    if score < 70:  return "high"
+    return "critical"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WATCH SCORE NORMALIZER
+# Converts watch risk_level string → 0-100 numeric score
+# so we can mathematically combine it with symptom score
+# ─────────────────────────────────────────────────────────────────────────────
+
+WATCH_LEVEL_TO_SCORE = {
+    "normal":   15.0,
+    "low":      15.0,
+    "moderate": 35.0,
+    "medium":   35.0,
+    "warning":  65.0,
+    "high":     65.0,
+    "critical": 90.0,
+}
+
+def _watch_score_from_latest(patient_id: str) -> Optional[dict]:
+    """
+    Fetches latest watch reading from store.
+    Returns dict with numeric score, level, age_minutes, hr, spo2, hrv.
+    Returns None if no recent data (older than 2 hours).
+    """
+    latest = store.get_latest(patient_id)
+    if not latest:
+        return None
+
+    processed_at = latest.get("processed_at", 0)
+    age_minutes = (time.time() - processed_at) / 60
+
+    # Only use watch data if it's recent (within 2 hours)
+    if age_minutes > 120:
+        return None
+
+    risk_level = latest.get("risk_level", "normal").lower()
+    ml_confidence = latest.get("ml_confidence")
+
+    # Use ML risk_score directly if available (0-1 scale → convert to 0-100)
+    raw_score = latest.get("risk_score")
+    if raw_score is not None:
+        # risk_score from analyzer is already 0-1 or 0-100, normalize to 0-100
+        watch_numeric = float(raw_score) * 100 if float(raw_score) <= 1 else float(raw_score)
+    else:
+        watch_numeric = WATCH_LEVEL_TO_SCORE.get(risk_level, 15.0)
+
+    return {
+        "score": round(watch_numeric, 1),
+        "level": risk_level,
+        "heart_rate": latest.get("heart_rate"),
+        "spo2": latest.get("spo2"),
+        "hrv_rmssd": latest.get("hrv_rmssd"),
+        "ml_confidence": ml_confidence,
+        "flags": latest.get("flags", []),
+        "age_minutes": round(age_minutes, 1),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COMBINED SCORING
+# Watch (ML) = 60% weight   |   Symptom (rules) = 40% weight
+# If no watch data → 100% symptom score
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _combine_scores(symptom_score: float, watch_data: Optional[dict]) -> tuple:
+    """
+    Returns (combined_score, method, watch_contribution, symptom_contribution)
+    """
+    if watch_data is None:
+        return symptom_score, "symptom_only", None, 100
+
+    watch_score = watch_data["score"]
+
+    # Weighted average: 60% watch, 40% symptom
+    combined = round((watch_score * 0.60) + (symptom_score * 0.40), 1)
+    combined = min(combined, 100.0)
+
+    return combined, "combined_ml_symptom", 60, 40
 
 
 RECS = {
@@ -307,17 +377,12 @@ def get_summary(patient_id: str):
     risk = latest.get("risk_level", "unknown").upper()
     flags = latest.get("flags", [])
     age_str = f"{int(age_minutes)}min ago"
-    if risk == "CRITICAL":
-        emoji = "CRITICAL ALERT"
-    elif risk == "WARNING":
-        emoji = "WARNING"
-    else:
-        emoji = "NORMAL"
+    if risk == "CRITICAL":   emoji = "CRITICAL ALERT"
+    elif risk == "WARNING":  emoji = "WARNING"
+    else:                    emoji = "NORMAL"
     msg = f"HR: {hr} bpm | {emoji} | {age_str}"
-    if spo2:
-        msg += f" | SpO2: {spo2}%"
-    if flags:
-        msg += " | " + ", ".join(flags).replace("_", " ")
+    if spo2:   msg += f" | SpO2: {spo2}%"
+    if flags:  msg += " | " + ", ".join(flags).replace("_", " ")
     return msg
 
 @app.websocket("/ws/watch/{patient_id}")
@@ -346,23 +411,51 @@ async def dashboard_ws(websocket: WebSocket):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NEW ROUTE — SYMPTOM ASSESSMENT
+# SYMPTOM ASSESSMENT — now with combined scoring
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/symptom-assessment")
 async def symptom_assessment(req: SymptomAssessmentRequest):
-    score, level, factors, bmi = _score(req)
+    # Step 1: Calculate symptom score
+    sym_score, factors, bmi = _symptom_score(req)
+
+    # Step 2: Fetch latest watch data (if patient_id provided and data is recent)
+    watch_data = None
+    if req.patient_id:
+        watch_data = _watch_score_from_latest(req.patient_id)
+
+    # Step 3: Combine scores
+    final_score, method, watch_weight, symptom_weight = _combine_scores(sym_score, watch_data)
+
+    # Step 4: Determine level and recommendation
+    level = _level(final_score)
     rec_en, rec_ne = RECS[level]
-    return {
+
+    # Step 5: Build response
+    response = {
         "patient_id": req.patient_id,
         "assessed_at": datetime.utcnow().isoformat() + "Z",
-        "risk_score": score,
+        "risk_score": final_score,
         "risk_level": level,
         "risk_factors": factors,
         "recommendation_en": rec_en,
         "recommendation_ne": rec_ne,
         "bmi": bmi,
+        "method": method,
+        # Breakdown so app can show both scores
+        "symptom_score": sym_score,
+        "symptom_weight_pct": symptom_weight,
+        "watch_data": {
+            "score": watch_data["score"],
+            "heart_rate": watch_data["heart_rate"],
+            "spo2": watch_data["spo2"],
+            "hrv_rmssd": watch_data["hrv_rmssd"],
+            "flags": watch_data["flags"],
+            "data_age_minutes": watch_data["age_minutes"],
+            "weight_pct": watch_weight,
+        } if watch_data else None,
     }
+    return response
 
 
 # ─────────────────────────────────────────────────────────────────────────────
