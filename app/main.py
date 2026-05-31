@@ -304,7 +304,26 @@ async def post_reading(reading: WatchReading):
     return await process_reading(reading)
 
 @app.post("/healthconnect")
-async def health_connect_webhook(payload: dict):
+async def health_connect_webhook_default(payload: dict):
+    """
+    Legacy endpoint — keeps your existing setup working.
+    Still saves under ankit_001 so your current watch sync is unaffected.
+    """
+    return await _process_healthconnect(payload, "ankit_001")
+
+
+@app.post("/healthconnect/{patient_id}")
+async def health_connect_webhook(patient_id: str, payload: dict):
+    """
+    Per-patient endpoint.
+    Each new patient sets their own URL:
+    https://web-production-73fb2.up.railway.app/healthconnect/ram_001
+    """
+    return await _process_healthconnect(payload, patient_id)
+
+
+async def _process_healthconnect(payload: dict, patient_id: str):
+    """Shared logic for both healthconnect endpoints."""
     try:
         from datetime import datetime, timezone
 
@@ -324,17 +343,17 @@ async def health_connect_webhook(payload: dict):
                         return r[k]
             return None
 
-        hr = latest_by_time(payload.get("heart_rate", []), ["bpm", "beatsPerMinute", "value"])
+        hr   = latest_by_time(payload.get("heart_rate", []), ["bpm", "beatsPerMinute", "value"])
         spo2 = latest_by_time(payload.get("oxygen_saturation", []), ["percentage", "value"])
         if spo2 and spo2 < 2:
             spo2 = spo2 * 100
-        hrv = latest_by_time(payload.get("heart_rate_variability", []), ["heartRateVariabilityMillis", "value"])
+        hrv  = latest_by_time(payload.get("heart_rate_variability", []), ["heartRateVariabilityMillis", "value"])
 
         if not hr:
-            return {"message": "No heart rate data found in payload", "received_keys": list(payload.keys())}
+            return {"message": "No heart rate data found", "patient_id": patient_id, "received_keys": list(payload.keys())}
 
         reading = WatchReading(
-            patient_id="ankit_001",
+            patient_id=patient_id,
             timestamp=time.time(),
             heart_rate=float(hr),
             spo2=float(spo2) if spo2 else None,
@@ -344,7 +363,7 @@ async def health_connect_webhook(payload: dict):
         return result
 
     except Exception as e:
-        return {"error": str(e), "received_keys": list(payload.keys())}
+        return {"error": str(e), "patient_id": patient_id, "received_keys": list(payload.keys())}
 
 @app.get("/patient/{patient_id}/status")
 def get_status(patient_id: str):
