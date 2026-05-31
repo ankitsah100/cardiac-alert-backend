@@ -7,9 +7,9 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-from typing import Optional
-import asyncio, json, time
+from typing import Optional, Literal
 from datetime import datetime
+import asyncio, json, time, math
 
 from .analyzer import CardiacAnalyzer
 from .alerts import AlertManager
@@ -25,6 +25,11 @@ dashboard_clients: list[WebSocket] = []
 
 # Auto-register default patient on startup
 store.register_patient({"patient_id": "ankit_001", "name": "Ankit", "age": 26, "emergency_contact": "+9779800000000", "baseline_hr": 72.0, "baseline_hrv": 45.0})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EXISTING MODELS
+# ─────────────────────────────────────────────────────────────────────────────
 
 class WatchReading(BaseModel):
     patient_id: str
@@ -42,6 +47,164 @@ class RegisterPatient(BaseModel):
     emergency_contact: str
     baseline_hr: Optional[float] = 72.0
     baseline_hrv: Optional[float] = 45.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NEW MODELS — SYMPTOM ASSESSMENT
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Symptoms(BaseModel):
+    chest_pain: bool = False
+    shortness_of_breath: bool = False
+    palpitations: bool = False
+    dizziness: bool = False
+    fatigue: bool = False
+    sweating: bool = False
+    nausea: bool = False
+    leg_swelling: bool = False
+
+class MedicalHistory(BaseModel):
+    diabetes: bool = False
+    hypertension: bool = False
+    previous_heart_attack: bool = False
+    family_history: bool = False
+    high_cholesterol: bool = False
+    stroke: bool = False
+    systolic_bp: Optional[float] = None
+    diastolic_bp: Optional[float] = None
+    cholesterol_level: Optional[float] = None
+    fasting_blood_sugar: Optional[float] = None
+
+class Lifestyle(BaseModel):
+    smoking: bool = False
+    alcohol: bool = False
+    exercise_frequency: str = "none"
+    stress_level: str = "low"
+    diet_quality: str = "average"
+
+class SymptomAssessmentRequest(BaseModel):
+    patient_id: Optional[str] = None
+    name: Optional[str] = None
+    age: int
+    gender: str = "male"
+    weight_kg: Optional[float] = None
+    height_cm: Optional[float] = None
+    symptoms: Symptoms = Symptoms()
+    medical_history: MedicalHistory = MedicalHistory()
+    lifestyle: Lifestyle = Lifestyle()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCORING ENGINE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _calc_bmi(w, h):
+    if w and h and h > 0:
+        return round(w / (h / 100) ** 2, 1)
+    return None
+
+def _score(req: SymptomAssessmentRequest):
+    s = 0.0
+    factors = []
+
+    def add(label, pts, sev):
+        nonlocal s
+        s += pts
+        factors.append({"factor": label, "contribution": round(pts, 1), "severity": sev})
+
+    # Age (Framingham weights)
+    age = req.age
+    if age >= 75:        add("Age 75+", 18, "high")
+    elif age >= 65:      add("Age 65-74", 13, "high")
+    elif age >= 55:      add("Age 55-64", 8, "medium")
+    elif age >= 45:      add("Age 45-54", 4, "medium")
+
+    # BMI
+    bmi = _calc_bmi(req.weight_kg, req.height_cm)
+    if bmi:
+        if bmi >= 35:    add(f"Severe obesity (BMI {bmi})", 7, "high")
+        elif bmi >= 30:  add(f"Obesity (BMI {bmi})", 4, "medium")
+        elif bmi >= 25:  add(f"Overweight (BMI {bmi})", 2, "low")
+
+    # Symptoms
+    sy = req.symptoms
+    if sy.chest_pain:             add("Chest pain", 14, "high")
+    if sy.shortness_of_breath:    add("Shortness of breath", 9, "high")
+    if sy.palpitations:           add("Palpitations", 7, "medium")
+    if sy.dizziness:              add("Dizziness", 6, "medium")
+    if sy.fatigue:                add("Unusual fatigue", 5, "medium")
+    if sy.sweating:               add("Excessive sweating", 5, "medium")
+    if sy.nausea:                 add("Nausea", 3, "low")
+    if sy.leg_swelling:           add("Leg edema", 6, "medium")
+    if sy.chest_pain and sy.shortness_of_breath:
+        add("ACS cluster (chest pain + dyspnea)", 8, "high")
+
+    # Medical history
+    h = req.medical_history
+    if h.previous_heart_attack:   add("Prior heart attack", 18, "high")
+    if h.stroke:                  add("Prior stroke", 12, "high")
+    if h.diabetes:                add("Diabetes", 10, "high")
+    if h.hypertension:            add("Hypertension", 9, "high")
+    if h.high_cholesterol:        add("High cholesterol", 7, "medium")
+    if h.family_history:          add("Family history CVD", 7, "medium")
+
+    if h.systolic_bp:
+        if h.systolic_bp >= 180:    add(f"Hypertensive crisis (SBP {h.systolic_bp})", 10, "high")
+        elif h.systolic_bp >= 160:  add(f"Stage 2 HTN (SBP {h.systolic_bp})", 6, "high")
+        elif h.systolic_bp >= 140:  add(f"Stage 1 HTN (SBP {h.systolic_bp})", 3, "medium")
+
+    if h.cholesterol_level:
+        if h.cholesterol_level >= 240:    add(f"High cholesterol ({h.cholesterol_level} mg/dL)", 5, "high")
+        elif h.cholesterol_level >= 200:  add(f"Borderline cholesterol ({h.cholesterol_level} mg/dL)", 2, "medium")
+
+    if h.fasting_blood_sugar:
+        if h.fasting_blood_sugar >= 126:  add(f"Diabetic glucose ({h.fasting_blood_sugar} mg/dL)", 6, "high")
+        elif h.fasting_blood_sugar >= 100: add(f"Pre-diabetic glucose ({h.fasting_blood_sugar} mg/dL)", 3, "medium")
+
+    # Lifestyle
+    lf = req.lifestyle
+    if lf.smoking:                        add("Active smoking", 10, "high")
+    if lf.alcohol:                        add("Alcohol use", 4, "medium")
+    if lf.exercise_frequency == "none":   add("Sedentary lifestyle", 6, "medium")
+    elif lf.exercise_frequency == "light": add("Low activity level", 3, "low")
+    if lf.stress_level == "high":         add("High chronic stress", 5, "medium")
+    elif lf.stress_level == "medium":     add("Moderate stress", 2, "low")
+    if lf.diet_quality == "poor":         add("Poor diet", 4, "medium")
+
+    score = min(round(s, 1), 100.0)
+    level = (
+        "low"      if score < 20 else
+        "medium"   if score < 45 else
+        "high"     if score < 70 else
+        "critical"
+    )
+    factors.sort(key=lambda x: x["contribution"], reverse=True)
+    return score, level, factors, bmi
+
+
+RECS = {
+    "low": (
+        "Cardiac risk is low. Maintain a healthy lifestyle and get a check-up every 1-2 years.",
+        "मुटु जोखिम कम छ। स्वस्थ जीवनशैली कायम राख्नुहोस् र हरेक १-२ वर्षमा स्वास्थ्य जाँच गर्नुहोस्।"
+    ),
+    "medium": (
+        "Moderate cardiac risk detected. See a doctor within 2-4 weeks. Monitor blood pressure and cholesterol.",
+        "मध्यम मुटु जोखिम पाइयो। २-४ हप्ताभित्र डाक्टरसँग सल्लाह लिनुहोस्। रक्तचाप र कोलेस्ट्रोल जाँच गर्नुहोस्।"
+    ),
+    "high": (
+        "High cardiac risk detected. Consult a cardiologist within 48-72 hours. Avoid strenuous activity until evaluated.",
+        "उच्च मुटु जोखिम पाइयो। ४८-७२ घण्टाभित्र हृदयरोग विशेषज्ञसँग परामर्श लिनुहोस्। मूल्यांकन नभएसम्म कठिन व्यायामबाट बच्नुहोस्।"
+    ),
+    "critical": (
+        "CRITICAL RISK. Call 102 (Nepal Ambulance) or go to the nearest hospital emergency immediately. Do not drive yourself.",
+        "अत्यन्त उच्च जोखिम। तुरुन्त १०२ (नेपाल एम्बुलेन्स) मा फोन गर्नुहोस् वा नजिकको अस्पतालको इमर्जेन्सीमा जानुहोस्। आफैं गाडी नचलाउनुहोस्।"
+    ),
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EXISTING ROUTES
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
 def root():
@@ -70,13 +233,8 @@ def register_patient(data: RegisterPatient):
 async def post_reading(reading: WatchReading):
     return await process_reading(reading)
 
-
 @app.post("/healthconnect")
 async def health_connect_webhook(payload: dict):
-    """
-    Accepts data from Life Dashboard Companion app.
-    Extracts heart rate, SpO2, HRV and processes them.
-    """
     try:
         from datetime import datetime, timezone
 
@@ -132,6 +290,36 @@ def get_history(patient_id: str, limit: int = 50):
         raise HTTPException(status_code=404, detail="Patient not found")
     return {"patient_id": patient_id, "readings": history}
 
+@app.get("/patient/{patient_id}/summary")
+def get_summary(patient_id: str):
+    import time as t
+    latest = store.get_latest(patient_id)
+    if not latest:
+        return "No data yet. Sync Life Dashboard first."
+    processed_at = latest.get("processed_at", 0)
+    age_minutes = (t.time() - processed_at) / 60
+    if age_minutes > 120:
+        h = int(age_minutes // 60)
+        m = int(age_minutes % 60)
+        return f"Last reading: {h}h {m}m ago. Open Life Dashboard and tap Sync Now."
+    hr = latest.get("heart_rate", "?")
+    spo2 = latest.get("spo2")
+    risk = latest.get("risk_level", "unknown").upper()
+    flags = latest.get("flags", [])
+    age_str = f"{int(age_minutes)}min ago"
+    if risk == "CRITICAL":
+        emoji = "CRITICAL ALERT"
+    elif risk == "WARNING":
+        emoji = "WARNING"
+    else:
+        emoji = "NORMAL"
+    msg = f"HR: {hr} bpm | {emoji} | {age_str}"
+    if spo2:
+        msg += f" | SpO2: {spo2}%"
+    if flags:
+        msg += " | " + ", ".join(flags).replace("_", " ")
+    return msg
+
 @app.websocket("/ws/watch/{patient_id}")
 async def watch_ws(websocket: WebSocket, patient_id: str):
     await websocket.accept()
@@ -155,6 +343,31 @@ async def dashboard_ws(websocket: WebSocket):
     except WebSocketDisconnect:
         if websocket in dashboard_clients:
             dashboard_clients.remove(websocket)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NEW ROUTE — SYMPTOM ASSESSMENT
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/symptom-assessment")
+async def symptom_assessment(req: SymptomAssessmentRequest):
+    score, level, factors, bmi = _score(req)
+    rec_en, rec_ne = RECS[level]
+    return {
+        "patient_id": req.patient_id,
+        "assessed_at": datetime.utcnow().isoformat() + "Z",
+        "risk_score": score,
+        "risk_level": level,
+        "risk_factors": factors,
+        "recommendation_en": rec_en,
+        "recommendation_ne": rec_ne,
+        "bmi": bmi,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INTERNAL HELPER
+# ─────────────────────────────────────────────────────────────────────────────
 
 async def process_reading(reading: WatchReading) -> dict:
     patient = store.get_patient(reading.patient_id)
@@ -186,33 +399,3 @@ async def process_reading(reading: WatchReading) -> dict:
             try: await ws.send_text(json.dumps({"type": "alert", "data": result}))
             except: dashboard_clients.remove(ws)
     return result
-
-@app.get("/patient/{patient_id}/summary")
-def get_summary(patient_id: str):
-    import time as t
-    latest = store.get_latest(patient_id)
-    if not latest:
-        return "No data yet. Sync Life Dashboard first."
-    processed_at = latest.get("processed_at", 0)
-    age_minutes = (t.time() - processed_at) / 60
-    if age_minutes > 120:
-        h = int(age_minutes // 60)
-        m = int(age_minutes % 60)
-        return f"Last reading: {h}h {m}m ago. Open Life Dashboard and tap Sync Now."
-    hr = latest.get("heart_rate", "?")
-    spo2 = latest.get("spo2")
-    risk = latest.get("risk_level", "unknown").upper()
-    flags = latest.get("flags", [])
-    age_str = f"{int(age_minutes)}min ago"
-    if risk == "CRITICAL":
-        emoji = "CRITICAL ALERT"
-    elif risk == "WARNING":
-        emoji = "WARNING"
-    else:
-        emoji = "NORMAL"
-    msg = f"HR: {hr} bpm | {emoji} | {age_str}"
-    if spo2:
-        msg += f" | SpO2: {spo2}%"
-    if flags:
-        msg += " | " + ", ".join(flags).replace("_", " ")
-    return msg
